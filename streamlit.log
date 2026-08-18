@@ -2,11 +2,11 @@ nohup: ignoring input
 
 Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
 
-2026-08-18 20:47:07.906 Uvicorn server started on 0.0.0.0:8501
+2026-08-18 21:20:33.079 Uvicorn server started on 0.0.0.0:8501
 
   You can now view your Streamlit app in your browser.
 
   Local URL: http://localhost:8501
   Network URL: http://21.0.6.240:8501
-  External URL: http://8.222.172.45:8501
+  External URL: http://8.222.152.132:8501
 
