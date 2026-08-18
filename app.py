@@ -3,6 +3,7 @@ OCI - Egyptian National ID Intelligent OCR, Validation and Document Analysis Sys
 Streamlit Application
 
 Interactive web interface for processing Egyptian National ID cards with PaddleOCR.
+Full pipeline: Detection → Rectification → Localization → OCR → Normalization → Validation → Consistency
 """
 
 import streamlit as st
@@ -11,14 +12,25 @@ import numpy as np
 from PIL import Image
 import io
 import base64
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import time
+import json
 
 # Import OCI components
 from app.pipeline.oci_pipeline import OCIPipeline
-from app.ocr.ocr_engine import PaddleOCREngine, get_paddle_engine
+from app.ocr.ocr_engine import PaddleOCREngine, get_paddle_engine, OCRCandidate
 from app.config.settings import get_config
 from app.schemas.models import FieldResult, FieldStatus
+from app.normalization.arabic_normalizer import (
+    normalize_arabic_text,
+    normalize_numeric_candidate,
+    normalize_gender_text,
+    is_mostly_arabic,
+    is_mostly_numeric,
+)
+from app.validation.nid_validator import NIDValidator, NIDValidationResult
+from app.validation.governorate_mapping import get_governorate_by_code
+from app.consistency.consistency_engine import ConsistencyEngine, ConsistencyStatus
 
 
 def initialize_session_state():
@@ -27,6 +39,10 @@ def initialize_session_state():
         st.session_state.pipeline = None
     if 'ocr_engine' not in st.session_state:
         st.session_state.ocr_engine = None
+    if 'nid_validator' not in st.session_state:
+        st.session_state.nid_validator = None
+    if 'consistency_engine' not in st.session_state:
+        st.session_state.consistency_engine = None
     if 'processing_complete' not in st.session_state:
         st.session_state.processing_complete = False
     if 'result' not in st.session_state:
@@ -34,14 +50,19 @@ def initialize_session_state():
 
 
 def load_ocr_engine():
-    """Load PaddleOCR engine."""
+    """Load PaddleOCR engine with Arabic support."""
     if st.session_state.ocr_engine is None:
-        with st.spinner("Loading PaddleOCR engine (this may take a moment)..."):
+        with st.spinner("🔄 Loading PaddleOCR engine (Arabic language model)..."):
             try:
                 st.session_state.ocr_engine = get_paddle_engine(lang="arabic")
                 # Initialize the engine
-                st.session_state.ocr_engine.initialize()
-                st.success("✅ PaddleOCR engine loaded successfully!")
+                init_success = st.session_state.ocr_engine.initialize()
+                if init_success:
+                    st.success("✅ PaddleOCR engine loaded successfully!")
+                    st.info("📚 Arabic text recognition ready")
+                else:
+                    st.error("❌ Failed to initialize PaddleOCR")
+                    return None
             except Exception as e:
                 st.error(f"❌ Failed to load PaddleOCR: {str(e)}")
                 return None
@@ -53,6 +74,21 @@ def load_pipeline():
     if st.session_state.pipeline is None:
         st.session_state.pipeline = OCIPipeline()
     return st.session_state.pipeline
+
+
+def load_nid_validator():
+    """Load NID validator."""
+    if st.session_state.nid_validator is None:
+        st.session_state.nid_validator = NIDValidator()
+    return st.session_state.nid_validator
+
+
+def load_consistency_engine():
+    """Load consistency engine."""
+    if st.session_state.consistency_engine is None:
+        validator = load_nid_validator()
+        st.session_state.consistency_engine = ConsistencyEngine(nid_validator=validator)
+    return st.session_state.consistency_engine
 
 
 def image_to_base64(image: np.ndarray) -> str:
@@ -115,63 +151,179 @@ def draw_field_boxes(image: np.ndarray, fields: Dict[str, FieldResult]) -> np.nd
     return viz
 
 
-def extract_field_value(ocr_engine: PaddleOCREngine, field_crop: np.ndarray, field_type: str) -> tuple:
+def preprocess_field_crop(crop: np.ndarray, field_type: str) -> np.ndarray:
     """
-    Extract value from a field crop using PaddleOCR.
-    Returns (value, confidence)
+    Apply field-specific preprocessing to optimize OCR accuracy.
+    
+    Args:
+        crop: Field crop image
+        field_type: Type of field ('nid', 'name', 'dob', etc.)
+    
+    Returns:
+        Preprocessed image
+    """
+    if len(crop.shape) == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop
+    
+    if field_type == 'nid':
+        # NID is purely numeric - use binary thresholding
+        _, enhanced = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Add slight dilation to connect broken characters
+        kernel = np.ones((1, 1), np.uint8)
+        enhanced = cv2.dilate(enhanced, kernel, iterations=1)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    
+    elif field_type == 'dob':
+        # DOB contains numbers and separators - adaptive thresholding
+        enhanced = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2
+        )
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    
+    elif field_type == 'gender':
+        # Gender is short Arabic text - mild enhancement
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, enhanced = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    
+    elif field_type in ['governorate', 'address', 'name']:
+        # Arabic text fields - preserve grayscale with contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    
+    return crop
+
+
+def extract_and_normalize_field(
+    ocr_engine: PaddleOCREngine,
+    field_crop: np.ndarray,
+    field_type: str
+) -> Tuple[Optional[str], float, str]:
+    """
+    Extract value from field crop using PaddleOCR and apply normalization.
+    
+    Args:
+        ocr_engine: PaddleOCR engine instance
+        field_crop: Field crop image
+        field_type: Type of field
+    
+    Returns:
+        Tuple of (normalized_value, confidence, raw_value)
     """
     if ocr_engine is None or not ocr_engine.is_initialized():
-        return None, 0.0
+        return None, 0.0, ""
     
     try:
-        # Apply preprocessing based on field type
-        if field_type == 'nid':
-            # NID is numeric - enhance contrast
-            if len(field_crop.shape) == 3:
-                gray = cv2.cvtColor(field_crop, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = field_crop
-            _, enhanced = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        else:
-            enhanced = field_crop
+        # Preprocess based on field type
+        enhanced = preprocess_field_crop(field_crop, field_type)
         
         # Run OCR
         candidates = ocr_engine.recognize_field(enhanced, field_type)
         
-        if candidates:
-            # Get best candidate
-            best = max(candidates, key=lambda c: c.ocr_confidence)
-            return best.value, best.ocr_confidence
+        if not candidates:
+            return None, 0.0, ""
         
-        return None, 0.0
+        # Get best candidate by confidence
+        best = max(candidates, key=lambda c: c.ocr_confidence)
+        raw_value = best.value
+        confidence = best.ocr_confidence
+        
+        # Apply field-specific normalization
+        normalized_value = normalize_field_value(raw_value, field_type)
+        
+        return normalized_value, confidence, raw_value
     
     except Exception as e:
         st.warning(f"OCR extraction error for {field_type}: {str(e)}")
-        return None, 0.0
+        return None, 0.0, ""
+
+
+def normalize_field_value(raw_value: str, field_type: str) -> Optional[str]:
+    """
+    Apply field-specific normalization to OCR output.
+    
+    Args:
+        raw_value: Raw OCR output
+        field_type: Type of field
+    
+    Returns:
+        Normalized value
+    """
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    
+    if field_type == 'nid':
+        # NID: Pure numeric normalization
+        normalized = normalize_numeric_candidate(raw_value)
+        return normalized if normalized else None
+    
+    elif field_type == 'dob':
+        # DOB: Normalize digits and common date formats
+        normalized = normalize_arabic_text(raw_value, normalize_digits=True, remove_diacritics_flag=True)
+        # Remove non-date characters except digits, /, -, .
+        cleaned = ''.join(c for c in normalized if c.isdigit() or c in '/-.')
+        return cleaned if cleaned else None
+    
+    elif field_type == 'gender':
+        # Gender: Normalize to 'male' or 'female'
+        normalized = normalize_gender_text(raw_value)
+        return normalized
+    
+    elif field_type == 'governorate':
+        # Governorate: Normalize Arabic text
+        normalized = normalize_arabic_text(raw_value, normalize_digits=False, remove_diacritics_flag=True)
+        return normalized if normalized.strip() else None
+    
+    elif field_type == 'name':
+        # Name: Normalize Arabic text but preserve structure
+        normalized = normalize_arabic_text(raw_value, normalize_digits=False, remove_diacritics_flag=True, normalize_ws=True)
+        return normalized if normalized.strip() else None
+    
+    elif field_type == 'address':
+        # Address: Normalize Arabic text
+        normalized = normalize_arabic_text(raw_value, normalize_digits=True, remove_diacritics_flag=True, normalize_ws=True)
+        return normalized if normalized.strip() else None
+    
+    return raw_value
 
 
 def process_image(image: np.ndarray, progress_bar):
-    """Process image through full pipeline."""
+    """
+    Process image through full OCI pipeline:
+    1. Card Detection
+    2. Perspective Rectification
+    3. Field Localization
+    4. OCR Extraction (PaddleOCR with Arabic support)
+    5. Text Normalization
+    6. NID Validation
+    7. Cross-Field Consistency Check
+    """
     results = {
         'success': False,
         'status': '',
         'card_detection': None,
         'rectification': None,
         'fields': {},
+        'normalized_fields': {},
+        'validation_results': {},
+        'consistency_result': None,
         'metrics': None,
         'canonical_image': None,
         'field_crops': {}
     }
     
     try:
-        # Load pipeline
+        # Step 1: Load pipeline
         pipeline = load_pipeline()
-        progress_bar.progress(10, text="Pipeline loaded")
+        progress_bar.progress(5, text="✅ Pipeline loaded")
         
-        # Run detection, rectification, and localization
+        # Step 2: Run detection, rectification, and localization
         pipeline_result = pipeline.process(image)
-        progress_bar.progress(40, text="Card detection & localization complete")
+        progress_bar.progress(25, text="✅ Card detection & localization complete")
         
         results['card_detection'] = pipeline_result.card_detection
         results['rectification'] = pipeline_result.rectification
@@ -181,48 +333,97 @@ def process_image(image: np.ndarray, progress_bar):
             results['canonical_image'] = pipeline_result.rectification.canonical_image
             canonical = pipeline_result.rectification.canonical_image
             
-            # Load OCR engine
+            # Step 3: Load OCR engine
             ocr_engine = load_ocr_engine()
-            progress_bar.progress(60, text="PaddleOCR loaded")
+            if not ocr_engine or not ocr_engine.is_initialized():
+                results['status'] = "OCR engine not available"
+                return results
             
-            if ocr_engine and ocr_engine.is_initialized():
-                # Extract each field
-                field_names = ['nid', 'name', 'dob', 'gender', 'governorate', 'address']
+            progress_bar.progress(40, text="✅ PaddleOCR loaded with Arabic support")
+            
+            # Step 4: Extract and normalize each field
+            field_names = ['nid', 'name', 'dob', 'gender', 'governorate', 'address']
+            
+            for i, field_name in enumerate(field_names):
+                field_result = pipeline_result.fields.get(field_name)
                 
-                for i, field_name in enumerate(field_names):
-                    field_result = pipeline_result.fields.get(field_name)
+                if field_result and field_result.bbox:
+                    bbox = field_result.bbox
                     
-                    if field_result and field_result.bbox:
-                        bbox = field_result.bbox
-                        
-                        # Extract field crop from canonical image
-                        field_crop = canonical[bbox.y1:bbox.y2, bbox.x1:bbox.x2]
-                        results['field_crops'][field_name] = field_crop
-                        
-                        # Run OCR on field
-                        value, confidence = extract_field_value(ocr_engine, field_crop, field_name)
-                        
-                        # Update field result
-                        field_result.value = value
-                        field_result.ocr_confidence = confidence
-                        
-                        if value:
-                            field_result.validation_status = FieldStatus.EXTRACTED
-                        else:
-                            field_result.validation_status = FieldStatus.OCR_FAILED
-                        
-                        results['fields'][field_name] = field_result
+                    # Extract field crop from canonical image
+                    field_crop = canonical[bbox.y1:bbox.y2, bbox.x1:bbox.x2]
+                    results['field_crops'][field_name] = field_crop
                     
-                    progress_bar.progress(60 + int((i+1) * 6), text=f"Extracted {field_name}")
+                    # Run OCR + Normalization
+                    normalized_value, confidence, raw_value = extract_and_normalize_field(
+                        ocr_engine, field_crop, field_name
+                    )
+                    
+                    # Update field result
+                    field_result.value = normalized_value
+                    field_result.raw_value = raw_value  # Store raw OCR output
+                    field_result.ocr_confidence = confidence
+                    
+                    if normalized_value:
+                        field_result.validation_status = FieldStatus.EXTRACTED
+                        results['normalized_fields'][field_name] = normalized_value
+                    else:
+                        field_result.validation_status = FieldStatus.OCR_FAILED
+                        field_result.failure_reason = "OCR extraction failed or normalization produced empty result"
+                    
+                    results['fields'][field_name] = field_result
                 
-                results['success'] = True
-                results['status'] = "extraction_complete"
-                progress_bar.progress(100, text="Processing complete!")
+                progress_bar.progress(40 + int((i+1) * 8), text=f"✅ Extracted & normalized {field_name}")
+            
+            # Step 5: Validate NID if extracted
+            nid_value = results['normalized_fields'].get('nid')
+            if nid_value:
+                validator = load_nid_validator()
+                nid_validation = validator.validate(nid_value)
+                results['validation_results']['nid'] = {
+                    'is_valid': nid_validation.is_valid,
+                    'status': nid_validation.status,
+                    'derived_dob': nid_validation.date_of_birth,
+                    'derived_gender': nid_validation.gender,
+                    'governorate_code': nid_validation.governorate_code,
+                    'governorate_name': nid_validation.governorate_name_arabic,
+                    'errors': nid_validation.errors,
+                    'warnings': nid_validation.warnings,
+                }
+                progress_bar.progress(90, text="✅ NID validation complete")
+            
+            # Step 6: Run consistency checks
+            consistency_engine = load_consistency_engine()
+            consistency_result = consistency_engine.check_all(
+                nid_value=nid_value,
+                dob_value=results['normalized_fields'].get('dob'),
+                gender_value=results['normalized_fields'].get('gender'),
+                governorate_value=results['normalized_fields'].get('governorate'),
+            )
+            results['consistency_result'] = {
+                'overall_status': consistency_result.overall_status.value,
+                'has_conflicts': consistency_result.has_conflicts,
+                'conflict_count': consistency_result.conflict_count,
+                'consistent_count': consistency_result.consistent_count,
+                'nid_dob_status': consistency_result.nid_dob_status.value,
+                'nid_gender_status': consistency_result.nid_gender_status.value,
+                'nid_governorate_status': consistency_result.nid_governorate_status.value,
+                'summary': consistency_result.summary,
+                'recommendations': consistency_result.recommendations,
+                'confidence_score': consistency_engine.get_confidence_score(consistency_result),
+            }
+            progress_bar.progress(95, text="✅ Consistency check complete")
+            
+            results['success'] = True
+            results['status'] = "processing_complete"
+            progress_bar.progress(100, text="🎉 Processing complete!")
         
         return results
     
     except Exception as e:
+        import traceback
         results['status'] = f"error: {str(e)}"
+        results['error_traceback'] = traceback.format_exc()
         return results
 
 
@@ -306,11 +507,20 @@ def main():
         - Governorate
         - Address
         
+        **Full Pipeline:**
+        1. ✅ Card Detection
+        2. ✅ Perspective Rectification
+        3. ✅ Field Localization
+        4. ✅ PaddleOCR (Arabic)
+        5. ✅ Text Normalization
+        6. ✅ NID Validation
+        7. ✅ Consistency Checks
+        
         **Features:**
-        - Automatic card detection
-        - Perspective correction
-        - Arabic text recognition
-        - Field-specific extraction
+        - Arabic-Indic digit conversion
+        - Diacritics removal
+        - Cross-field validation
+        - Confidence scoring
         """)
     
     # Main content area
@@ -443,29 +653,117 @@ def main():
                                     use_container_width=True
                                 )
                 
+                # Show validation results
+                if results.get('validation_results', {}).get('nid'):
+                    st.subheader("✅ NID Validation")
+                    nid_val = results['validation_results']['nid']
+                    
+                    val_col1, val_col2, val_col3 = st.columns(3)
+                    
+                    with val_col1:
+                        status_icon = "✅" if nid_val['is_valid'] else "⚠️"
+                        st.metric(f"{status_icon} Validity", nid_val['status'])
+                    
+                    with val_col2:
+                        if nid_val['derived_dob']:
+                            st.metric("📅 Derived DOB", nid_val['derived_dob'])
+                    
+                    with val_col3:
+                        if nid_val['derived_gender']:
+                            gender_display = "👨 Male" if nid_val['derived_gender'] == 'male' else "👩 Female"
+                            st.metric("⚧ Derived Gender", gender_display)
+                    
+                    # Show governorate info
+                    if nid_val.get('governorate_name'):
+                        st.info(f"📍 Governorate from NID: {nid_val['governorate_name']} (Code: {nid_val['governorate_code']})")
+                    
+                    # Show warnings/errors
+                    if nid_val.get('warnings'):
+                        for warning in nid_val['warnings']:
+                            st.warning(f"⚠️ {warning}")
+                    
+                    if nid_val.get('errors'):
+                        for error in nid_val['errors']:
+                            st.error(f"❌ {error}")
+                
+                # Show consistency check results
+                if results.get('consistency_result'):
+                    st.subheader("🔗 Cross-Field Consistency Check")
+                    cons = results['consistency_result']
+                    
+                    # Overall status
+                    overall_icon = {"consistent": "✅", "conflict": "⚠️", "unknown": "❓"}.get(cons['overall_status'], "❓")
+                    st.markdown(f"**{overall_icon} Overall Status:** {cons['overall_status'].upper()}")
+                    
+                    # Confidence score
+                    conf_score = cons.get('confidence_score', 0)
+                    st.progress(conf_score, text=f"Confidence Score: {conf_score:.1%}")
+                    
+                    # Summary stats
+                    stat_col1, stat_col2, stat_col3 = st.columns(3)
+                    stat_col1.metric("✅ Consistent Checks", cons['consistent_count'])
+                    stat_col2.metric("⚠️ Conflicts", cons['conflict_count'])
+                    stat_col3.metric("❓ Unknown", cons.get('unknown_count', 0))
+                    
+                    # Individual check statuses
+                    st.markdown("**Detailed Checks:**")
+                    check_cols = st.columns(3)
+                    
+                    dob_icon = {"consistent": "✅", "conflict": "⚠️", "unknown": "❓", "missing": "➖"}.get(cons['nid_dob_status'], "❓")
+                    check_cols[0].markdown(f"{dob_icon} **NID ↔ DOB:** {cons['nid_dob_status']}")
+                    
+                    gender_icon = {"consistent": "✅", "conflict": "⚠️", "unknown": "❓", "missing": "➖"}.get(cons['nid_gender_status'], "❓")
+                    check_cols[1].markdown(f"{gender_icon} **NID ↔ Gender:** {cons['nid_gender_status']}")
+                    
+                    gov_icon = {"consistent": "✅", "conflict": "⚠️", "unknown": "❓", "missing": "➖"}.get(cons['nid_governorate_status'], "❓")
+                    check_cols[2].markdown(f"{gov_icon} **NID ↔ Governorate:** {cons['nid_governorate_status']}")
+                    
+                    # Recommendations
+                    if cons.get('recommendations'):
+                        st.markdown("**💡 Recommendations:**")
+                        for rec in cons['recommendations']:
+                            st.info(rec)
+                    
+                    if cons.get('summary'):
+                        st.caption(f"Summary: {cons['summary']}")
+                
                 # Download results
                 st.subheader("💾 Export Results")
                 
-                # Create JSON export
+                # Create comprehensive JSON export
                 import json
                 export_data = {
                     'status': results['status'],
-                    'fields': {}
+                    'normalized_fields': results.get('normalized_fields', {}),
+                    'raw_fields': {},
+                    'validation_results': results.get('validation_results', {}),
+                    'consistency_result': results.get('consistency_result'),
+                    'metrics': {
+                        'card_detection_time_ms': results['metrics'].card_detection_time_ms if results.get('metrics') else None,
+                        'rectification_time_ms': results['metrics'].rectification_time_ms if results.get('metrics') else None,
+                        'total_time_ms': results['metrics'].total_time_ms if results.get('metrics') else None,
+                    } if results.get('metrics') else None,
                 }
                 
+                # Add raw and processed field data
                 for field_name, field_result in results['fields'].items():
+                    export_data['raw_fields'][field_name] = getattr(field_result, 'raw_value', None)
+                    if 'fields' not in export_data:
+                        export_data['fields'] = {}
                     export_data['fields'][field_name] = {
-                        'value': field_result.value,
+                        'normalized_value': field_result.value,
+                        'raw_value': getattr(field_result, 'raw_value', None),
                         'confidence': field_result.ocr_confidence if hasattr(field_result, 'ocr_confidence') else None,
-                        'status': field_result.validation_status.value if field_result.validation_status else None
+                        'status': field_result.validation_status.value if field_result.validation_status else None,
+                        'failure_reason': getattr(field_result, 'failure_reason', None),
                     }
                 
                 json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
                 
                 st.download_button(
-                    label="📥 Download Results (JSON)",
+                    label="📥 Download Full Results (JSON)",
                     data=json_str,
-                    file_name="id_extraction_results.json",
+                    file_name="id_extraction_full_results.json",
                     mime="application/json",
                     use_container_width=True
                 )
