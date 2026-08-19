@@ -101,24 +101,25 @@ class LocalizationConfig:
     """Field localization parameters."""
     # Normalized layout coordinates (0-1 scale relative to canonical card)
     # These are INITIAL PROPOSALS only, not final bboxes
+    # Updated based on actual Egyptian National ID card layout analysis
     
-    # National ID Number region
-    nid_region: Tuple[float, float, float, float] = (0.05, 0.15, 0.95, 0.30)
+    # National ID Number region - top section, full width
+    nid_region: Tuple[float, float, float, float] = (0.02, 0.08, 0.98, 0.22)
     
-    # Full Arabic Name region
-    name_region: Tuple[float, float, float, float] = (0.05, 0.30, 0.95, 0.45)
+    # Full Arabic Name region - below NID, full width  
+    name_region: Tuple[float, float, float, float] = (0.02, 0.24, 0.98, 0.42)
     
-    # Date of Birth region
-    dob_region: Tuple[float, float, float, float] = (0.05, 0.45, 0.50, 0.58)
+    # Date of Birth region - middle left section
+    dob_region: Tuple[float, float, float, float] = (0.02, 0.44, 0.48, 0.56)
     
-    # Gender region
-    gender_region: Tuple[float, float, float, float] = (0.55, 0.45, 0.95, 0.58)
+    # Gender region - middle right section (next to DOB)
+    gender_region: Tuple[float, float, float, float] = (0.52, 0.44, 0.98, 0.56)
     
-    # Governorate region
-    governorate_region: Tuple[float, float, float, float] = (0.05, 0.58, 0.50, 0.72)
+    # Governorate region - below DOB on left
+    governorate_region: Tuple[float, float, float, float] = (0.02, 0.58, 0.48, 0.72)
     
-    # Address region
-    address_region: Tuple[float, float, float, float] = (0.05, 0.72, 0.95, 0.90)
+    # Address region - bottom section, full width
+    address_region: Tuple[float, float, float, float] = (0.02, 0.74, 0.98, 0.92)
     
     # Field-specific parameters
     nid_min_digit_density: float = 0.4
